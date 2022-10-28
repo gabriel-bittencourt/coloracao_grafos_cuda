@@ -65,6 +65,8 @@ vector<int> Coloring::min_max(vector<int> weights){
 
         for (int j = 0; j < this->graph->getV(); j++) {
 
+            if (weights[j] == -1) continue;
+
             if (adj[i][j]) {
 
                 w_weight = weights[j];
@@ -95,15 +97,19 @@ Solution *Coloring::greedy_coloring(){
      * 
      * @return Solution* Solution to the coloring problem
      */
-    vector<int> weights = this->generate_random_weights();
+    // vector<int> weights = this->generate_random_weights();
+
+    vector<int> weights = {9, 4, 3, 2, 8, 7, 6, 1, 0, 5};
+
     vector<int> min_max;
 
     vector<vector<bool>> adj = this->graph->getAdjacencyMatrix();
 
     Solution *solution = new Solution(this->graph->getV());
 
-    int current_color = 1;
+    int current_color = 0;
     int max_color = this->graph->getV() + 1;
+    bool used_second_color = false;
 
     int n_colored_vertices = 0;
 
@@ -123,13 +129,18 @@ Solution *Coloring::greedy_coloring(){
             // The vertex is a local max
             else if (min_max[i] == 2) {
                 solution->colors[i] = current_color + 1;
+                used_second_color = true;
             }
 
             weights[i] = -1;      // Mark as colored
             n_colored_vertices++; // Increment the number of colored vertices
         }
 
-        current_color += 2; // Update the current color
+        if (used_second_color)
+            current_color += 2;
+        else
+            current_color++;
+
 
     } while(n_colored_vertices < this->graph->getV());
 
