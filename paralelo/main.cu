@@ -1,8 +1,35 @@
 #include <iostream>
 #include <stdio.h>
 
+#define MAX 1
+#define MIN 2
 
-__global__ void min_max(int *d_graph, int *d_weights, int *d_min_max, int N){
+#define checkError(E)                                               \
+    do{                                                             \
+        if(err != cudaSuccess){                                     \
+            printf("CUDA error: %s\n", cudaGetErrorString(E));      \
+            return E;                                               \
+        }                                                           \
+    } while(0)
+
+__global__
+void color_vertices(int *d_weights, int *d_min_max, int *d_coloring, int *current_color, int *n_colored_vertices){
+    int index = threadIdx.x + blockIdx.x * blockDim.x;
+
+    // Vértice não deve ser colorido nessa iteração
+    if(!d_min_max[index]) return;
+
+    d_coloring[index] = *current_color + d_min_max[index];
+    d_weights[index] = -1;
+
+    // Atualiza variáveis de controle
+    // TODO: Algum jeito melhor pra decidir a cor atual?
+    atomicMax(current_color, d_coloring[index]);
+    atomicAdd(n_colored_vertices, 1);
+}
+
+__global__
+void min_max(int *d_graph, int *d_weights, int *d_min_max, int N){
 
     int index = threadIdx.x + blockIdx.x * blockDim.x;
 
@@ -37,11 +64,10 @@ __global__ void min_max(int *d_graph, int *d_weights, int *d_min_max, int N){
 
     // v não tem vizinhos válidos
     if (is_v_max && is_v_min)
-        d_min_max[v] = 1;
+        d_min_max[v] = MAX;
 
-    else if (is_v_min) d_min_max[v] = 1;
-    else if (is_v_max) d_min_max[v] = 2;
-
+    else if (is_v_min) d_min_max[v] = MAX;
+    else if (is_v_max) d_min_max[v] = MIN;
 }
 
 int main() {
@@ -66,39 +92,61 @@ int main() {
     size_t size = sizeof(int);
 
     // Vetor de pesos
-    // TODO: Gerar aleatoriamente
+    // TODO: Gerar aleatoriamente: sequência + shuffle
     int weights[] = {9, 4, 3, 2, 8, 7, 6, 1, 0, 5};
 
-    // Vetor com coloração (host)
-    int *coloring = (int*) malloc(size * N);
+    // Vetor de coloração (host)
+    int *g_coloring = (int*) malloc(size * N);
+    int g_n_colored_vertices;
 
-    // Vetor de minmax (host)
-    int *g_min_max = (int*) malloc(size * N);
+    int *d_n_colored_vertices,    // Número de vértices coloridos
+        *d_current_color;         // Cor atual
 
-    int *d_graph,   // Grafo no device (array 1D)
-        *d_weights, // Vetor de pesos no device
-        *d_min_max; // Vetor de minmax (device)
+    int *d_graph,    // Grafo no device (array 1D)
+        *d_weights,  // Vetor de pesos no device
+        *d_min_max,  // Vetor de minmax (device)
+        *d_coloring; // Vetor com coloração (device)
+
+    cudaError_t err;
+
+    // Aloca variável no device e inicializa com 0
+    err = cudaMalloc((void**) &d_n_colored_vertices, size);
+    checkError(err);
+    err = cudaMemset(d_n_colored_vertices, 0, size);
+    checkError(err);
+
+    // Aloca variável no device e inicializa com -1
+    err = cudaMalloc((void**) &d_current_color, size);
+    checkError(err);
+    err = cudaMemset(d_current_color, -1, size);
+    checkError(err);
 
     // Aloca grafo no device e copia para lá
-    cudaMalloc((void**) &d_graph, N * N * size);
-    cudaMemcpy(d_graph, graph, N * N * size, cudaMemcpyHostToDevice);
+    err = cudaMalloc((void**) &d_graph, N * N * size);
+    checkError(err);
+    err = cudaMemcpy(d_graph, graph, N * N * size, cudaMemcpyHostToDevice);
+    checkError(err);
     
     // Aloca vetor de pesos no device e copia para lá
-    cudaMalloc((void**) &d_weights, N * size);
-    cudaMemcpy(d_weights, weights, N * size, cudaMemcpyHostToDevice);
+    err = cudaMalloc((void**) &d_weights, N * size);
+    checkError(err);
+    err = cudaMemcpy(d_weights, weights, N * size, cudaMemcpyHostToDevice);
+    checkError(err);
     
     // Aloca vetor de minmax no device e inicializa com 0s
-    cudaMalloc((void**) &d_min_max, N * size);
-    cudaMemset(d_min_max, 0, N * size);
+    err = cudaMalloc((void**) &d_min_max, N * size);
+    checkError(err);
+    err = cudaMemset(d_min_max, 0, N * size);
+    checkError(err);
+
+    // Aloca vetor de coloração no device e inicializa com 0s
+    err = cudaMalloc((void**) &d_coloring, N * size);
+    checkError(err);
 
     // Número de blocos e threads por bloco
     // TODO: Usar cudaDeviceProp
     int n_blocks = 1;
     int n_threads = N;
-
-    int n_colored_vertices = 0;      // Número de vértices coloridos
-    int current_color = 0;           // Cor atual
-    bool used_second_color = false;  // Usou a segunda cor
 
     do {
         // Calcula os vértices que são mínimos e máximos
@@ -107,60 +155,53 @@ int main() {
         // Aguarda todos os threads terminarem
         cudaDeviceSynchronize();
 
-        // Carrega o vetor com os vértices que são min ou max para o host
-        cudaMemcpy(g_min_max, d_min_max, N * size, cudaMemcpyDeviceToHost);
+        // TODO(?): fazer min_max e coloração em um único kernel, para evitar sincronização no host
+        //          verificar a possibilidade
+        color_vertices<<<n_blocks, n_threads>>>(d_weights, d_min_max, d_coloring,
+                                              d_current_color, d_n_colored_vertices);
 
-        for(int i = 0; i < N; i++){
-            
-            // Se o vértice i não é nem máximo nem mínimo
-            if (!g_min_max[i]) continue;
-
-            // Se o vértice i é máximo
-            if (g_min_max[i] == 1)
-                coloring[i] = current_color;
-
-            // Se o vértice i é mínimo
-            else if (g_min_max[i] == 2){
-                coloring[i] = current_color + 1;
-                used_second_color = true;
-            }
-
-            weights[i] = -1;
-            n_colored_vertices++;
-
-        }
-
-        // Atualiza o vetor de pesos no device
-        // TODO: Atualizar esses pesos só na memória do device
-        cudaMemcpy(d_weights, weights, N * size, cudaMemcpyHostToDevice);
-
-        // Atualiza a cor atual
-        if (used_second_color) current_color += 2;
-        else current_color++;
-
-        used_second_color = false;
+        // Aguarda todos os threads terminarem
+        cudaDeviceSynchronize();
 
         // Reseta o vetor de min e max
-        // TODO (?): Resetar esse vetor só na memória do device
-        cudaMemset(d_min_max, 0, N * size);
+        err = cudaMemset(d_min_max, 0, N * size);
+        checkError(err);
 
-    } while (n_colored_vertices < N); // Enquanto não colorir todos os vértices
+        // Atualiza o número de vértices coloridos no host
+        err = cudaMemcpy(&g_n_colored_vertices, d_n_colored_vertices, size, cudaMemcpyDeviceToHost);
+        checkError(err);
+
+    } while (g_n_colored_vertices < N); // Enquanto não colorir todos os vértices
+
+    err = cudaMemcpy(g_coloring, d_coloring, N * size, cudaMemcpyDeviceToHost);
+    checkError(err);
 
     // Imprime a coloração
     printf("Coloração: ");
     for (int i = 0; i < N; i++){
-        printf("%d ", coloring[i]);
+        printf("%d ", g_coloring[i]);
     }
     printf("\n");
 
     // Libera memória do device
-    cudaFree(d_graph);
-    cudaFree(d_weights);
-    cudaFree(d_min_max);
+    err = cudaFree(d_graph);
+    checkError(err);
+    err = cudaFree(d_weights);
+    checkError(err);
+
+    err = cudaFree(d_min_max);
+    checkError(err);
+    err = cudaFree(d_coloring);
+    checkError(err);
+
+    err = cudaFree(d_current_color);
+    checkError(err);
+    err = cudaFree(d_n_colored_vertices);
+    checkError(err);
 
     // Libera memória do host
-    free(coloring);
-    free(g_min_max);
+    free(g_coloring);
+
     // free(weights);
     // for(int i = 0; i < N; i++)
     //     free(graph[i]);
