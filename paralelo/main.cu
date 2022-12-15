@@ -1,5 +1,7 @@
 #include <math.h>
 #include <stdio.h>
+#include <thrust/device_vector.h>
+#include <thrust/sequence.h>
 #include <thrust/sort.h>
 #include <iostream>
 #include <vector>
@@ -12,7 +14,7 @@
 using namespace std;
 
 __global__ void min_max(int* d_adj_list,
-                        int* d_list_size,
+                        int* d_degree,
                         int* d_weights,
                         int* d_min_max,
                         int N,
@@ -33,7 +35,7 @@ __global__ void min_max(int* d_adj_list,
   bool is_v_min = true;
 
   // Percorre todos as arestas do vértice v
-  for (int i = 0; i < d_list_size[v]; i++) {
+  for (int i = 0; i < d_degree[v]; i++) {
     int w = d_adj_list[v * M + i];
     w_weight = d_weights[w];
     if (w_weight == -1)
@@ -108,28 +110,25 @@ int main(int argc, char const* argv[]) {
   }
   char const* matrix_file_name = argv[1];
 
-  // Grafo na estrutura de matriz de adjacência
+  // Grafo na estrutura de lista de adjacência
   printf("Lendo arquivo...\n");
   vector<vi> graph = read_matrix(matrix_file_name);
   printf("Completo!\n");
 
-  int M = INT_MIN;  // maior lista de vizinhos
+  int M = INT_MIN;  // maior grau
   int N = graph.size();
   size_t size = sizeof(int);
   int g_n_colored_vertices, n_colors_used;
 
   srand(time(NULL));
 
-  // Vetor de pesos
-  int weights[N], list_size[N], keys[N];
-  for (int i = 0; i < N; i++) {
-    weights[i] = i;
-    keys[i] = rand();
-    list_size[i] = graph[i].size();  // tamanho da vizinhança
-    M = max((int)M, list_size[i]);   // descobre o maior tamanho
-  }
+  int degree[N], keys[N];
 
-  thrust::sort_by_key(keys, keys + N, weights);
+  for (int i = 0; i < N; i++) {
+    keys[i] = rand();
+    degree[i] = graph[i].size();  // grau do vértice
+    M = max((int)M, degree[i]);   // maior grau
+  }
 
   printf("M = %d | N = %d\n", M, N);
 
@@ -141,10 +140,10 @@ int main(int argc, char const* argv[]) {
 
   int* d_adj_list;  // lista de adjacência
 
-  int *d_list_size,  // Número de vizinhos dos vértices
-      *d_weights,    // Vetor de pesos no device
-      *d_min_max,    // Vetor de minmax (device)
-      *d_coloring;   // Vetor com coloração (device)
+  int *d_degree,    // Número de vizinhos dos vértices
+      *d_weights,   // Vetor de pesos no device
+      *d_min_max,   // Vetor de minmax (device)
+      *d_coloring;  // Vetor com coloração (device)
 
   // Aloca variável no device e inicializa com 0
   cudaMalloc((void**)&d_n_colored_vertices, size);
@@ -162,12 +161,19 @@ int main(int argc, char const* argv[]) {
   }
 
   // Aloca vetor com tamanho das vizinhanças
-  cudaMalloc((void**)&d_list_size, size * N);
-  cudaMemcpy(d_list_size, list_size, N * size, cudaMemcpyHostToDevice);
+  cudaMalloc((void**)&d_degree, size * N);
+  cudaMemcpy(d_degree, degree, N * size, cudaMemcpyHostToDevice);
 
-  // Aloca vetor de pesos no device e copia para lá
-  cudaMalloc((void**)&d_weights, N * size);
-  cudaMemcpy(d_weights, weights, N * size, cudaMemcpyHostToDevice);
+  // Aleatorização dos pesos:
+  cudaMalloc((void**)&d_weights, N * size);  // aloca o vetor de pesos
+  // transforma em objeto thrust
+  thrust::device_ptr<int> t_weights = thrust::device_pointer_cast(d_weights);
+  // inicializa como uma sequencia
+  thrust::sequence(t_weights, t_weights + N, 0);
+  // vetor das keys aleatórias no device
+  thrust::device_vector<int> d_keys(keys, keys + N);
+  // ordena os pesos de acordo com as keys
+  thrust::sort_by_key(d_keys.begin(), d_keys.end(), t_weights);
 
   // Aloca vetor de minmax no device e inicializa com 0s
   cudaMalloc((void**)&d_min_max, N * size);
@@ -183,8 +189,8 @@ int main(int argc, char const* argv[]) {
   int n_blocks = ceil((double)N / (double)n_threads);
 
   do {
-    min_max<<<n_blocks, n_threads>>>(d_adj_list, d_list_size, d_weights,
-                                     d_min_max, N, M);
+    min_max<<<n_blocks, n_threads>>>(d_adj_list, d_degree, d_weights, d_min_max,
+                                     N, M);
     cudaDeviceSynchronize();
     color_vertices<<<n_blocks, n_threads>>>(d_weights, d_min_max, d_coloring,
                                             d_current_color,
@@ -217,13 +223,12 @@ int main(int argc, char const* argv[]) {
 
   // Libera memória do device
   cudaFree(d_adj_list);
-  cudaFree(d_list_size);
+  cudaFree(d_degree);
   cudaFree(d_weights);
   cudaFree(d_min_max);
   cudaFree(d_coloring);
   cudaFree(d_current_color);
   cudaFree(d_n_colored_vertices);
-
   // // Libera memória do host
   // free(g_coloring);
 
